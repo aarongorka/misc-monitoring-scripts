@@ -19,7 +19,7 @@ import fileinput
 import pymssql
 import socket
 
-def is_ag(hostname):
+def is_ag(hostname, cursor):
   "Returns True if the server is in an Availability Group"
   cursor.execute("SELECT CONVERT(sysname, SERVERPROPERTY('IsHadrEnabled'))")
   partofag = cursor.fetchone()
@@ -31,7 +31,7 @@ def is_ag(hostname):
   logging.debug('Part of an AG? {}'.format(is_ag))
   return(is_ag)
 
-def get_listeners(hostname):
+def get_listeners(hostname, cursor):
   "Returns a list of listeners present for any AGs that the specified host is part of"
   listeners = []
   cursor.execute("SELECT dns_name FROM sys.availability_group_listeners")
@@ -42,16 +42,16 @@ def get_listeners(hostname):
   logging.info('List of listeners: {}'.format(listeners))
   return(listeners)
 
-def is_listener(hostname):
+def is_listener(hostname, cursor):
   "Returns True if the given hostname is a listener, false if it's an instance"
   is_listener = False
-  listeners = get_listeners(hostname)
-  if shorthost.upper() in (listener.upper() for listener in listeners):
+  listeners = get_listeners(hostname, cursor)
+  if hostname.upper() in (listener.upper() for listener in listeners):
     return(True)
   else:
     return(False)
 
-def get_all_databases(hostname):
+def get_all_databases(hostname, cursor):
   "Gets a list of all databases available on an AG or instance"
   databases = []
   cursor.execute("SELECT name FROM sys.databases")
@@ -62,7 +62,7 @@ def get_all_databases(hostname):
   logging.debug("List of all databases: {}".format(databases))
   return(databases)
 
-def get_listener_databases(hostname):
+def get_listener_databases(hostname, cursor):
   "Returns a list of database to be included on a given listener. This query was created in collaboration with mkoshy."
   koshy = []
   cursor.execute("""
@@ -92,7 +92,7 @@ and AGL.dns_name=\'""" + hostname + "\'")
   logging.info('List of listener databases: {}'.format(koshy))
   return(koshy)
 
-def get_instance_databases(hostname):
+def get_instance_databases(hostname, cursor):
   "Returns a list of databases to add to excluded from a given instance."
   ag_databases = []
   # If it's an instance, we want to exclude any databases assigned to any listener
@@ -128,9 +128,10 @@ def update_command(line, databases, is_listener):
       line = re.sub("$", " --name='^()$$' --regexp\n", line)
     line = re.sub("(?<=--name=)'.*' ", "'^(" + '|'.join(databases).strip('|') + ")$$' ", line) # Add all databases to be included
   else:
+    line = line.rstrip()
     alreadyexcluded = get_already_excluded(line)
     if alreadyexcluded:
-      databases += get_already_excluded(line)
+      databases += alreadyexcluded
     else:
       line = re.sub("$", r" --name='^(?\!(XX_PLACEHOLDER)$$)' --regexp", line) # Just preparing the proceding regexes and making sure we don't leave an invalid config behind
     databases.insert(0, 'tempdb')
@@ -140,30 +141,31 @@ def update_command(line, databases, is_listener):
     databases = list(sorted(set(databases))) # sort and uniq
     logging.debug("Full list of databases to be excluded: {}".format(databases))
     line = re.sub("(?<=--name=)'.*' ", "'^(?\!(" + '|'.join(databases).strip('|') + ")$$)' ", line) # Add all databases to be excluded
+    line = line + '\n'
   return(line)
 
-def update_file(filename):
+def update_file(filename, hostname, cursor):
   "Updates a file"
   logging.debug('Filename is {}'.format(filename))
 
-  if not is_ag(shorthost):
+  if not is_ag(hostname, cursor):
     logging.critical("This server is not part of an AG. Nothing to do.")
     exit()
 
-  if is_listener(shorthost):
+  if is_listener(hostname, cursor):
     logging.info("Listener: True")
-    databases = get_listener_databases(shorthost)
+    databases = get_listener_databases(hostname, cursor)
     if not databases:
       logging.warning("There are no databases to monitor on {}.".format(server))
   else:
     logging.info("Listener: False")
-    databases = get_instance_databases(shorthost)
+    databases = get_instance_databases(hostname, cursor)
 
   fh = open(filename, 'r')
   lines = fh.readlines()
   for lineno,line in enumerate(lines):
     if re.search('.*check_command.*check_mssql_health.*(?:database-free|backup-age|transactions)', line):
-      lines[lineno] = update_command(line, databases, is_listener(shorthost))
+      lines[lineno] = update_command(line, databases, is_listener(hostname, cursor))
       logging.info('Edited line no. {}:\n{}\n{}'.format(str(lineno), line.rstrip(), lines[lineno].rstrip()))
   fh.close()
 
@@ -196,9 +198,9 @@ def main():
   logging.debug('Server name is {}'.format(server))
   # Get domain to use in authentication
   domain =    server.split('.', 1)[1]
-  shorthost = server.split('.', 1)[0]
+  hostname = server.split('.', 1)[0]
   logging.debug('Domain name is {}'.format(domain))
-  logging.debug('Short hostname is {}'.format(shorthost))
+  logging.debug('Short hostname is {}'.format(hostname))
   
   # init variables
   databases = []
@@ -239,4 +241,7 @@ def main():
   else:
     logging.debug('Connected.')
   
-  update_file(filename)
+  update_file(filename, hostname, cursor)
+
+if __name__ == '__main__':
+    main()
